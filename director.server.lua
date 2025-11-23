@@ -1,242 +1,342 @@
--- Event Director: Orchestrates random events
-
-local ServerStorage = game:GetService("ServerStorage")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+-- Sistema raccolta prodotti (server-side completo)
 local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
 
--- Wait for LobbyManager to initialize
-repeat task.wait(0.1) until _G.LobbyManager
+print("[Grocery] Sistema raccolta prodotti inizializzato")
 
--- Load RemoteEvents
-local eventRemotes = ReplicatedStorage:WaitForChild("EventRemotes")
-local broadcastWarning = eventRemotes:WaitForChild("BroadcastWarning")
-local showRestingUI = eventRemotes:WaitForChild("ShowRestingUI")
+-- Configurazione
+local PICKUP_RANGE = 8
+local PICKUP_HOLD_TIME = 0.5
+local MAX_CART_ITEMS = 20
+local PRODUCTS_TO_HIGHLIGHT = 5
 
--- ==========================================
--- Map Management - Initialize BEFORE loading event modules
--- ==========================================
-local currentMap = nil
+-- Traccia gli inventari e i prodotti evidenziati
+local playerInventories = {}
+local highlightedProducts = {}
+local playerHighlights = {} -- Traccia gli highlight per ogni player
 
-local function loadMap(mapName)
-	if currentMap then
-		currentMap:Destroy() -- Remove the previous map
+-- Ottieni inventario player
+local function getPlayerInventory(player)
+	if not playerInventories[player.UserId] then
+		playerInventories[player.UserId] = {}
 	end
+	return playerInventories[player.UserId]
+end
 
-	local mapTemplate = ServerStorage.Maps:FindFirstChild(mapName)
-	if mapTemplate then
-		currentMap = mapTemplate:Clone()
-		currentMap.Parent = workspace
-		print("Loaded map:", mapName)
-		
-		-- Clear MapBounds cache when a new map is loaded
-		if _G.MapBounds then
-			_G.MapBounds.ClearCache()
+-- Controlla se un player è attaccato al carrello
+local function isPlayerAttached(player)
+	if not player.Character then return false end
+	local root = player.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return false end
+	return root:FindFirstChild("PlayerCartWeld") ~= nil
+end
+
+-- Mostra highlight per un player specifico
+local function showHighlightsForPlayer(player)
+	if playerHighlights[player.UserId] then return end -- Già mostrati
+	
+	playerHighlights[player.UserId] = {}
+	
+	for product, _ in pairs(highlightedProducts) do
+		if product and product.Parent then
+			local highlight = Instance.new("Highlight")
+			highlight.FillColor = Color3.fromRGB(255, 255, 0)
+			highlight.OutlineColor = Color3.fromRGB(255, 200, 0)
+			highlight.FillTransparency = 0.5
+			highlight.OutlineTransparency = 0
+			highlight.Parent = product
+			
+			table.insert(playerHighlights[player.UserId], highlight)
 		end
-	else
-		warn("Map not found:", mapName)
 	end
 end
 
-local function cleanupMap()
-	if currentMap then
-		currentMap:Destroy()
-		currentMap = nil
-		print("Map cleaned up.")
-		
-		-- Clear MapBounds cache when map is removed
-		if _G.MapBounds then
-			_G.MapBounds.ClearCache()
+-- Nascondi highlight per un player specifico
+local function hideHighlightsForPlayer(player)
+	if not playerHighlights[player.UserId] then return end
+	
+	for _, highlight in ipairs(playerHighlights[player.UserId]) do
+		if highlight and highlight.Parent then
+			highlight:Destroy()
 		end
-	end
-end
-
--- Make these functions available globally for event modules
-_G.EventDirector = _G.EventDirector or {}
-_G.EventDirector.LoadMap = loadMap
-_G.EventDirector.CleanupMap = cleanupMap
-
--- ==========================================
--- Helper function: Check if any players are alive in the map
--- ==========================================
-local function arePlayersAliveInMap()
-	local MapBounds = _G.MapBounds
-	if not MapBounds then
-		return true -- Default to continuing if we can't check
 	end
 	
-	for _, player in ipairs(Players:GetPlayers()) do
-		if player.Character then
-			local humanoid = player.Character:FindFirstChild("Humanoid")
-			local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
-			
-			if humanoid and rootPart and humanoid.Health > 0 then
-				-- Check if player is inside the map
-				if MapBounds.IsInsideMap(rootPart.Position) then
-					return true -- Found at least one alive player in map
-				end
+	playerHighlights[player.UserId] = nil
+end
+
+-- Monitora lo stato di attacco al carrello per ogni player
+local function monitorPlayerAttachment(player)
+	local wasAttached = false
+	
+	-- Loop continuo per controllare lo stato
+	while player.Parent do
+		local isAttached = isPlayerAttached(player)
+		
+		if isAttached and not wasAttached then
+			-- Appena attaccato, mostra highlight
+			showHighlightsForPlayer(player)
+			wasAttached = true
+		elseif not isAttached and wasAttached then
+			-- Appena staccato, nascondi highlight
+			hideHighlightsForPlayer(player)
+			wasAttached = false
+		end
+		
+		task.wait(0.5) -- Controlla ogni mezzo secondo
+	end
+end
+
+-- Evidenzia prodotti randomici in una shelf
+local function highlightRandomProducts(shelf, numToHighlight)
+	local allProducts = {}
+	
+	-- Trova tutti i Model (prodotti) nella shelf, escludi "Shelf" e "Highlight"
+	for _, model in ipairs(shelf:GetChildren()) do
+		if model:IsA("Model") and model.Name ~= "Shelf" then
+			table.insert(allProducts, model)
+		end
+	end
+	
+	print("[Grocery] Found", #allProducts, "products in", shelf.Name)
+	
+	-- Seleziona randomicamente
+	numToHighlight = math.min(numToHighlight or PRODUCTS_TO_HIGHLIGHT, #allProducts)
+	
+	for i = 1, numToHighlight do
+		if #allProducts == 0 then break end
+		
+		local randomIndex = math.random(1, #allProducts)
+		local product = table.remove(allProducts, randomIndex)
+		
+		-- Trova la parte su cui mettere Highlight e ProximityPrompt
+		local targetPart = product.PrimaryPart or product:FindFirstChildWhichIsA("BasePart")
+		if not targetPart then
+			warn("[Grocery] Product senza BasePart:", product.Name)
+			continue
+		end
+		
+		-- NON creare Highlight qui, verrà creato dinamicamente per ogni player
+		
+		-- Crea ProximityPrompt sulla parte
+		local prompt = Instance.new("ProximityPrompt")
+		prompt.ActionText = "Pick up"
+		prompt.ObjectText = "Product"
+		prompt.KeyboardKeyCode = Enum.KeyCode.F
+		prompt.HoldDuration = PICKUP_HOLD_TIME
+		prompt.MaxActivationDistance = PICKUP_RANGE
+		prompt.RequiresLineOfSight = false
+		prompt.Style = Enum.ProximityPromptStyle.Default -- Usa la GUI nera standard
+		prompt.Parent = targetPart
+		
+		-- Listener per Triggered
+		prompt.Triggered:Connect(function(player)
+			pickupProduct(player, product)
+		end)
+		
+		highlightedProducts[product] = true
+	end
+	
+	print("[Grocery] Highlighted", numToHighlight, "products in", shelf.Name)
+end
+
+-- Pickup prodotto
+function pickupProduct(player, product)
+	if not highlightedProducts[product] then return false end
+	
+	local character = player.Character
+	if not character then return false end
+	
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return false end
+	
+	-- Verifica carrello
+	local weld = root:FindFirstChild("PlayerCartWeld")
+	if not weld then
+		warn("[Grocery] Player senza carrello:", player.Name)
+		return false
+	end
+	
+	local cart = weld.Part1 and weld.Part1.Parent
+	if not cart then return false end
+	
+	-- Verifica limiti
+	local inventory = getPlayerInventory(player)
+	if #inventory >= MAX_CART_ITEMS then
+		warn("[Grocery] Carrello pieno")
+		return false
+	end
+	
+	-- Aggiungi a inventario
+	local productPosition = product:GetPivot().Position
+	table.insert(inventory, {Name = product.Name, Position = productPosition})
+	
+	-- Rimuovi highlight e prompt
+	local highlight = product:FindFirstChildOfClass("Highlight")
+	if highlight then highlight:Destroy() end
+	
+	for _, part in ipairs(product:GetDescendants()) do
+		if part:IsA("ProximityPrompt") then
+			part:Destroy()
+		end
+	end
+	
+	-- Nascondi originale (non clonare)
+	for _, part in ipairs(product:GetDescendants()) do
+		if part:IsA("BasePart") or part:IsA("UnionOperation") then
+			part.Transparency = 1
+			part.CanCollide = false
+		end
+	end
+	
+	highlightedProducts[product] = nil
+	
+	-- Pesca un model casuale da ServerStorage.CartProducts
+	local cartProductsFolder = ServerStorage:FindFirstChild("CartProducts")
+	if not cartProductsFolder then
+		warn("[Grocery] Folder 'CartProducts' non trovata in ServerStorage!")
+		return false
+	end
+	
+	local availableModels = cartProductsFolder:GetChildren()
+	if #availableModels == 0 then
+		warn("[Grocery] Nessun model in ServerStorage.CartProducts!")
+		return false
+	end
+	
+	-- Scegli un model casuale (o l'unico disponibile)
+	local randomModel = availableModels[math.random(1, #availableModels)]
+	local clone = randomModel:Clone()
+	
+	-- Trova o imposta la PrimaryPart prima di scalare
+	if not clone.PrimaryPart then
+		clone.PrimaryPart = clone:FindFirstChildWhichIsA("BasePart") or clone:FindFirstChildWhichIsA("UnionOperation")
+	end
+	
+	-- Disabilita collisioni e anchored per tutte le parti
+	for _, part in ipairs(clone:GetDescendants()) do
+		if part:IsA("BasePart") or part:IsA("UnionOperation") then
+			part.CanCollide = false
+			part.Anchored = false
+		end
+	end
+	
+	-- Welda tutte le parti del model tra loro per evitare che si smolecolino
+	local primaryPart = clone.PrimaryPart
+	if primaryPart then
+		for _, part in ipairs(clone:GetDescendants()) do
+			if (part:IsA("BasePart") or part:IsA("UnionOperation")) and part ~= primaryPart then
+				local internalWeld = Instance.new("WeldConstraint")
+				internalWeld.Part0 = primaryPart
+				internalWeld.Part1 = part
+				internalWeld.Parent = part
 			end
 		end
 	end
 	
-	return false -- No alive players in map
-end
-
--- Make this function available globally for event modules
-_G.EventDirector.ArePlayersAliveInMap = arePlayersAliveInMap
-
--- Load all event modules from ServerStorage
-local eventDirector = ServerStorage:WaitForChild("EventDirector")
-local eventModulesFolder = eventDirector:WaitForChild("EventModules")
-local eventModules = {}
-
--- Load and expose MapBounds globally for events to use
-local MapBounds = require(eventDirector.Shared:WaitForChild("map-bounds"))
-_G.MapBounds = MapBounds
-
-print("Director: Loading event modules...")
-for _, moduleScript in ipairs(eventModulesFolder:GetChildren()) do
-	if moduleScript:IsA("ModuleScript") then
-		local success, module = pcall(function()
-			return require(moduleScript)
-		end)
-		
-		if success then
-			table.insert(eventModules, module)
-			print("Loaded:", moduleScript.Name)
-		else
-			warn("Error loading:", moduleScript.Name, "-", module)
-		end
-	end
-end
-
-print("Director: Loaded", #eventModules, "events")
-
--- Configuration
-local MIN_WAIT_TIME = 25 
-local MAX_WAIT_TIME = 25
-local MIN_PLAYERS = 1
-local currentState = "Idle"
-local restStartTime = nil
-local restEndTime = nil
-
--- Handle new players joining during rest
-Players.PlayerAdded:Connect(function(player)
-	-- Wait for player to load
-	player.CharacterAdded:Wait()
-	task.wait(1) -- Give time for client scripts to load
+	-- Pulisci clone
+	local cloneHighlight = clone:FindFirstChildOfClass("Highlight")
+	if cloneHighlight then cloneHighlight:Destroy() end
+	local clonePrompt = clone:FindFirstChildOfClass("ProximityPrompt")
+	if clonePrompt then clonePrompt:Destroy() end
 	
-	-- If we're resting, show them the UI
-	if currentState == "Idle" and restEndTime then
-		local remainingTime = restEndTime - tick()
-		if remainingTime > 0 then
-			showRestingUI:FireClient(player, true, remainingTime)
+	-- Weld al carrello
+	local cartMain = cart:FindFirstChild("Main")
+	if cartMain then
+		-- Trova la parte principale del clone da weldare (BasePart o Union)
+		local clonePrimaryPart = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart") or clone:FindFirstChildWhichIsA("UnionOperation")
+		if not clonePrimaryPart then
+			warn("[Grocery] Clone senza BasePart/Union per weld")
+			return false
+		end
+		
+		-- Imposta come PrimaryPart se non è già impostata
+		if not clone.PrimaryPart then
+			clone.PrimaryPart = clonePrimaryPart
+		end
+		
+		local weldConstraint = Instance.new("WeldConstraint")
+		weldConstraint.Part0 = cartMain
+		weldConstraint.Part1 = clonePrimaryPart
+		weldConstraint.Parent = clonePrimaryPart
+		
+		-- Posiziona nel carrello
+		-- Usa la ProductZone se esiste, altrimenti fallback a Main
+		local productZone = cart:FindFirstChild("ProductZone", true) or cartMain
+		
+		-- Posiziona i prodotti dentro il carrello in modo organizzato
+		local column = (#inventory - 1) % 3 -- Colonna (0, 1, 2)
+		local row = math.floor((#inventory - 1) / 3) -- Riga
+		
+		local offsetX = (column - 1) * 0.4 -- Spaziatura orizzontale
+		local offsetY = 0.5 + (row * 0.4) -- Impila verticalmente
+		local offsetZ = 0 -- Centrato in profondità
+		
+		clone:SetPrimaryPartCFrame(productZone.CFrame * CFrame.new(offsetX, offsetY, offsetZ))
+		
+		clone.Parent = cart
+	end
+	
+	print("[Grocery]", player.Name, "picked up product")
+	return true
+end
+
+-- Setup shelfs
+local function setupShelfs()
+	local storeFolder = workspace:FindFirstChild("Store")
+	if not storeFolder then
+		warn("[Grocery] Folder 'Store' non trovata!")
+		return
+	end
+	local shelfsFolder = storeFolder:FindFirstChild("Shelfs")
+	if not shelfsFolder then
+		warn("[Grocery] Folder 'Shelfs' non trovata dentro 'store'!")
+		return
+	end
+	
+	-- Conta quante shelf ci sono
+	local allShelfs = {}
+	for _, shelf in ipairs(shelfsFolder:GetChildren()) do
+		if shelf:IsA("Model") and shelf.Name == "ShefWithProducts" then
+			table.insert(allShelfs, shelf)
 		end
 	end
+	
+	if #allShelfs == 0 then
+		warn("[Grocery] Nessuna shelf trovata!")
+		return
+	end
+	
+	-- Distribuisci i prodotti equamente tra tutte le shelf
+	local productsPerShelf = math.ceil(PRODUCTS_TO_HIGHLIGHT / #allShelfs)
+	
+	for _, shelf in ipairs(allShelfs) do
+		highlightRandomProducts(shelf, productsPerShelf)
+	end
+	
+	print("[Grocery] Setup completato su", #allShelfs, "shelf")
+end
+
+-- Cleanup
+Players.PlayerRemoving:Connect(function(player)
+	playerInventories[player.UserId] = nil
+	hideHighlightsForPlayer(player)
 end)
 
--- Main Director Loop 
-while true do
-	-- ==========================================
-	-- 1. PHASE: IDLE (Rest)
-	-- ==========================================
-	currentState = "Idle"
-	local waitTime = math.random(MIN_WAIT_TIME, MAX_WAIT_TIME)
-	restStartTime = tick()
-	restEndTime = restStartTime + waitTime
-	print("Director: Resting for", waitTime, "seconds...")
-	
-	-- Show resting UI to all players
-	showRestingUI:FireAllClients(true, waitTime)
-	
-	task.wait(waitTime)
-	
-	-- Hide resting UI
-	showRestingUI:FireAllClients(false)
-	restEndTime = nil
-	
-	-- ==========================================
-	-- 2. PHASE: CHECK (Can we start?)
-	-- ==========================================
-	if #Players:GetPlayers() < MIN_PLAYERS then
-		print("Director: Not enough players. Resting...")
-		continue
-	end
-	
-	if #eventModules == 0 then
-		warn("Director: No events available!")
-		continue
-	end
-	
-	-- ==========================================
-	-- 3. PHASE: SELECTION (Choose an event)
-	-- ==========================================
-	local chosenEvent = eventModules[math.random(1, #eventModules)]
-	local eventData = chosenEvent.GetInfo()
-	
-	print("Director: Event selected -", eventData.Name)
-	
-	-- ==========================================
-	-- 4. PHASE: WARNING (Warn players and prepare lobby)
-	-- ==========================================
-	currentState = "Warning"
-	print("Director: Broadcasting warning to clients -", eventData.Name)
-	broadcastWarning:FireAllClients(eventData.Name, eventData.WarningDuration)
-	
-	-- Load the map for the event FIRST
-	local mapName = nil
-	if chosenEvent.GetMapName then
-		mapName = chosenEvent.GetMapName()
-		if mapName then
-			loadMap(mapName)
-			-- Wait for the map to fully load and replicate
-			task.wait(1)
-			print("Director: Map loaded and ready")
-		end
-	end
-	
-	-- NOW move players from lobby to game (after map is fully loaded)
-	_G.LobbyManager.StartEvent(mapName)
-	
-	-- Continue waiting for the warning duration
-	task.wait(eventData.WarningDuration - 1) -- Subtract the 1 second we already waited
-	
-	-- ==========================================
-	-- 5. PHASE: ACTIVE (Start the event)
-	-- ==========================================
-	currentState = "Active"
-	print("Director: Starting event -", eventData.Name)
-	
-	local success, errorMsg = pcall(function()
-		chosenEvent.Start() -- This function yields (blocking)
+-- Monitora i player esistenti e nuovi
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(function()
+		monitorPlayerAttachment(player)
 	end)
-	
-	if not success then
-		warn("Director: Error during event:", errorMsg)
-	else
-		print("Director: Event completed -", eventData.Name)
-	end
-	
-	-- ==========================================
-	-- 6. PHASE: CLEANUP
-	-- ==========================================
-	currentState = "Cleanup"
-	print("Director: Cleaning up after event...")
-	
-	local cleanupSuccess, cleanupError = pcall(function()
-		chosenEvent.Cleanup()
-	end)
-	
-	if not cleanupSuccess then
-		warn("Director: Error during cleanup:", cleanupError)
-	end
-	
-	-- Award points and return players to lobby FIRST
-	-- (LobbyManager.EndEvent() will wait for players to teleport)
-	_G.LobbyManager.EndEvent()
-	
-	-- NOW cleanup the map after everyone is safely in lobby
-	print("Director: Unloading map...")
-	cleanupMap()
-	
-	print("Director: Cycle completed. Returning to Idle.\n")
 end
+
+Players.PlayerAdded:Connect(function(player)
+	task.spawn(function()
+		monitorPlayerAttachment(player)
+	end)
+end)
+
+-- Avvia dopo 2 secondi
+task.wait(2)
+setupShelfs()
+
+print("[Grocery] Sistema pronto")
