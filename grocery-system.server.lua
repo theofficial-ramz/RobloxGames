@@ -1,342 +1,364 @@
--- Sistema raccolta prodotti (server-side completo)
+--!strict
+--[[
+	PetReplication.luau
+	
+	Handles all the server-side pet logic. This script spawns the visual models
+	and makes them follow players around.
+	
+	I used a velocity-based movement system instead of just setting CFrame directly
+	because it makes the movement look way smoother and less robotic.
+]]
+
+local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
-local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-print("[Grocery] Sistema raccolta prodotti inizializzato")
+local Config = require(ReplicatedStorage.PetSystem.Config)
+local Types = require(ReplicatedStorage.PetSystem.types)
 
--- Configurazione
-local PICKUP_RANGE = 8
-local PICKUP_HOLD_TIME = 0.5
-local MAX_CART_ITEMS = 20
-local PRODUCTS_TO_HIGHLIGHT = 5
+local PetReplication = {}
 
--- Traccia gli inventari e i prodotti evidenziati
-local playerInventories = {}
-local highlightedProducts = {}
-local playerHighlights = {} -- Traccia gli highlight per ogni player
+-- Keeps track of every pet currently spawned in the world
+-- Structure: ActivePets[Player][UUID] = { Model, PetId, PetIndex, Velocity, FloatTime }
+local ActivePets: { [Player]: { [string]: any } } = {}
 
--- Ottieni inventario player
-local function getPlayerInventory(player)
-	if not playerInventories[player.UserId] then
-		playerInventories[player.UserId] = {}
+-- Folder in workspace to keep things organized
+local serverPetsFolder: Folder = nil
+
+-- Used to throttle updates if we need to save performance
+local frameCount = 0
+
+-- Just creates the folder if it doesn't exist
+local function InitServerPetsFolder()
+	serverPetsFolder = Workspace:FindFirstChild("ServerPets")
+	if not serverPetsFolder then
+		serverPetsFolder = Instance.new("Folder")
+		serverPetsFolder.Name = "ServerPets"
+		serverPetsFolder.Parent = Workspace
 	end
-	return playerInventories[player.UserId]
+end
+-- Calculates where a pet should be positioned relative to the player
+local function CalculatePetPosition(character: Model, petIndex: number, totalPets: number): Vector3?
+	local rootPart = character.PrimaryPart or character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return nil
+	end
+
+	-- Config for the formation shape
+	local columns = Config.Constants.PetGridColumns
+	local baseRadius = 5 -- How far behind the player the first row starts
+	local rowSpacing = 3 -- Gap between rows
+	local arcSpread = math.pi * 0.75 -- 135 degrees arc
+
+	-- Figure out grid position
+	local row = math.floor((petIndex - 1) / columns)
+	local col = (petIndex - 1) % columns
+
+	local petsInThisRow = math.min(columns, totalPets - (row * columns))
+
+	if petsInThisRow == 1 then
+		-- If it's the only pet in this row, put it dead center
+		local radius = baseRadius + (row * rowSpacing)
+		local targetPos = rootPart.Position + (-rootPart.CFrame.LookVector * radius)
+		targetPos += Vector3.new(0, Config.Constants.PetYOffset, 0)
+		return targetPos
+	else
+		-- Spread them out in an arc if there's more than one
+		local radius = baseRadius + (row * rowSpacing)
+
+		-- Map the column to an angle on the arc
+		local t = col / (petsInThisRow - 1)
+		local angle = (t - 0.5) * arcSpread -- Center it so 0 is straight back
+
+		-- Trig to get the offset
+		local sideOffset = math.sin(angle) * radius
+		local backOffset = math.cos(angle) * radius
+
+		-- Apply offsets relative to player rotation
+		local targetPos = rootPart.Position
+			+ (-rootPart.CFrame.LookVector * backOffset)
+			+ (rootPart.CFrame.RightVector * sideOffset)
+
+		targetPos += Vector3.new(0, Config.Constants.PetYOffset, 0)
+
+		return targetPos
+	end
 end
 
--- Controlla se un player è attaccato al carrello
-local function isPlayerAttached(player)
-	if not player.Character then return false end
-	local root = player.Character:FindFirstChild("HumanoidRootPart")
-	if not root then return false end
-	return root:FindFirstChild("PlayerCartWeld") ~= nil
-end
+-- Spawns the actual visual model for the pet
+function PetReplication.SpawnPet(player: Player, petData: Types.PetData, petIndex: number)
+	if not ActivePets[player] then
+		ActivePets[player] = {}
+	end
 
--- Mostra highlight per un player specifico
-local function showHighlightsForPlayer(player)
-	if playerHighlights[player.UserId] then return end -- Già mostrati
-	
-	playerHighlights[player.UserId] = {}
-	
-	for product, _ in pairs(highlightedProducts) do
-		if product and product.Parent then
-			local highlight = Instance.new("Highlight")
-			highlight.FillColor = Color3.fromRGB(255, 255, 0)
-			highlight.OutlineColor = Color3.fromRGB(255, 200, 0)
-			highlight.FillTransparency = 0.5
-			highlight.OutlineTransparency = 0
-			highlight.Parent = product
-			
-			table.insert(playerHighlights[player.UserId], highlight)
+	-- Prevent duplicates
+	if ActivePets[player][petData.UUID] then
+		warn(`Pet {petData.UUID} already spawned for {player.Name}`)
+		return
+	end
+
+	local petConfig = Config.Pets[petData.Id]
+	if not petConfig then
+		warn(`Pet config not found for {petData.Id}`)
+		return
+	end
+
+	local petsFolder = ReplicatedStorage:FindFirstChild("Pets")
+	if not petsFolder then
+		warn("ReplicatedStorage.Pets folder not found")
+		return
+	end
+
+	local petTemplate = petsFolder:FindFirstChild(petConfig.Model)
+	if not petTemplate then
+		warn(`Pet model not found: {petConfig.Model}`)
+		return
+	end
+
+	local petModel = petTemplate:Clone()
+	petModel.Name = `Pet_{player.UserId}_{petData.UUID}`
+
+	-- identification
+	petModel:SetAttribute("OwnerUserId", player.UserId)
+	petModel:SetAttribute("PetUUID", petData.UUID)
+	petModel:SetAttribute("PetId", petData.Id)
+
+	local scale = Config.Constants.PetScale or 1
+	if petModel.PrimaryPart then
+		petModel:ScaleTo(scale)
+	end
+
+	-- Disable collisions so pets don't push players around
+	for _, descendant in petModel:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.CanCollide = false
+			descendant.Massless = true
 		end
 	end
-end
 
--- Nascondi highlight per un player specifico
-local function hideHighlightsForPlayer(player)
-	if not playerHighlights[player.UserId] then return end
-	
-	for _, highlight in ipairs(playerHighlights[player.UserId]) do
-		if highlight and highlight.Parent then
-			highlight:Destroy()
+	-- Sanity check
+	if not petModel.PrimaryPart then
+		local primaryPart = petModel:FindFirstChildWhichIsA("BasePart")
+		if primaryPart then
+			petModel.PrimaryPart = primaryPart
+		else
+			warn(`[PetReplication] No BasePart found in pet model {petData.Id}`)
+			petModel:Destroy()
+			return
 		end
 	end
-	
-	playerHighlights[player.UserId] = nil
-end
 
--- Monitora lo stato di attacco al carrello per ogni player
-local function monitorPlayerAttachment(player)
-	local wasAttached = false
-	
-	-- Loop continuo per controllare lo stato
-	while player.Parent do
-		local isAttached = isPlayerAttached(player)
-		
-		if isAttached and not wasAttached then
-			-- Appena attaccato, mostra highlight
-			showHighlightsForPlayer(player)
-			wasAttached = true
-		elseif not isAttached and wasAttached then
-			-- Appena staccato, nascondi highlight
-			hideHighlightsForPlayer(player)
-			wasAttached = false
-		end
-		
-		task.wait(0.5) -- Controlla ogni mezzo secondo
+	-- Count how many pets they have to update positions
+	local totalPets = 0
+	for _ in ActivePets[player] do
+		totalPets += 1
 	end
-end
+	totalPets += 1
 
--- Evidenzia prodotti randomici in una shelf
-local function highlightRandomProducts(shelf, numToHighlight)
-	local allProducts = {}
-	
-	-- Trova tutti i Model (prodotti) nella shelf, escludi "Shelf" e "Highlight"
-	for _, model in ipairs(shelf:GetChildren()) do
-		if model:IsA("Model") and model.Name ~= "Shelf" then
-			table.insert(allProducts, model)
-		end
-	end
-	
-	print("[Grocery] Found", #allProducts, "products in", shelf.Name)
-	
-	-- Seleziona randomicamente
-	numToHighlight = math.min(numToHighlight or PRODUCTS_TO_HIGHLIGHT, #allProducts)
-	
-	for i = 1, numToHighlight do
-		if #allProducts == 0 then break end
-		
-		local randomIndex = math.random(1, #allProducts)
-		local product = table.remove(allProducts, randomIndex)
-		
-		-- Trova la parte su cui mettere Highlight e ProximityPrompt
-		local targetPart = product.PrimaryPart or product:FindFirstChildWhichIsA("BasePart")
-		if not targetPart then
-			warn("[Grocery] Product senza BasePart:", product.Name)
-			continue
-		end
-		
-		-- NON creare Highlight qui, verrà creato dinamicamente per ogni player
-		
-		-- Crea ProximityPrompt sulla parte
-		local prompt = Instance.new("ProximityPrompt")
-		prompt.ActionText = "Pick up"
-		prompt.ObjectText = "Product"
-		prompt.KeyboardKeyCode = Enum.KeyCode.F
-		prompt.HoldDuration = PICKUP_HOLD_TIME
-		prompt.MaxActivationDistance = PICKUP_RANGE
-		prompt.RequiresLineOfSight = false
-		prompt.Style = Enum.ProximityPromptStyle.Default -- Usa la GUI nera standard
-		prompt.Parent = targetPart
-		
-		-- Listener per Triggered
-		prompt.Triggered:Connect(function(player)
-			pickupProduct(player, product)
-		end)
-		
-		highlightedProducts[product] = true
-	end
-	
-	print("[Grocery] Highlighted", numToHighlight, "products in", shelf.Name)
-end
-
--- Pickup prodotto
-function pickupProduct(player, product)
-	if not highlightedProducts[product] then return false end
-	
+	-- Snap to correct position immediately
 	local character = player.Character
-	if not character then return false end
-	
-	local root = character:FindFirstChild("HumanoidRootPart")
-	if not root then return false end
-	
-	-- Verifica carrello
-	local weld = root:FindFirstChild("PlayerCartWeld")
-	if not weld then
-		warn("[Grocery] Player senza carrello:", player.Name)
-		return false
-	end
-	
-	local cart = weld.Part1 and weld.Part1.Parent
-	if not cart then return false end
-	
-	-- Verifica limiti
-	local inventory = getPlayerInventory(player)
-	if #inventory >= MAX_CART_ITEMS then
-		warn("[Grocery] Carrello pieno")
-		return false
-	end
-	
-	-- Aggiungi a inventario
-	local productPosition = product:GetPivot().Position
-	table.insert(inventory, {Name = product.Name, Position = productPosition})
-	
-	-- Rimuovi highlight e prompt
-	local highlight = product:FindFirstChildOfClass("Highlight")
-	if highlight then highlight:Destroy() end
-	
-	for _, part in ipairs(product:GetDescendants()) do
-		if part:IsA("ProximityPrompt") then
-			part:Destroy()
+	if character then
+		local targetPos = CalculatePetPosition(character, petIndex, totalPets)
+		if targetPos then
+			petModel:SetPrimaryPartCFrame(CFrame.new(targetPos))
 		end
 	end
-	
-	-- Nascondi originale (non clonare)
-	for _, part in ipairs(product:GetDescendants()) do
-		if part:IsA("BasePart") or part:IsA("UnionOperation") then
-			part.Transparency = 1
-			part.CanCollide = false
+
+	-- Important: Only anchor the root. Weld everything else to it.
+	-- This is much more performant than anchoring everything.
+	petModel.PrimaryPart.Anchored = true
+
+	for _, descendant in petModel:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant ~= petModel.PrimaryPart then
+			descendant.Anchored = false
+
+			local weld = Instance.new("Weld")
+			weld.Part0 = petModel.PrimaryPart
+			weld.Part1 = descendant
+			weld.C0 = petModel.PrimaryPart.CFrame:Inverse() * descendant.CFrame
+			weld.Parent = petModel.PrimaryPart
 		end
 	end
-	
-	highlightedProducts[product] = nil
-	
-	-- Pesca un model casuale da ServerStorage.CartProducts
-	local cartProductsFolder = ServerStorage:FindFirstChild("CartProducts")
-	if not cartProductsFolder then
-		warn("[Grocery] Folder 'CartProducts' non trovata in ServerStorage!")
-		return false
+
+	petModel.Parent = serverPetsFolder
+
+	ActivePets[player][petData.UUID] = {
+		Model = petModel,
+		PetId = petData.Id,
+		PetIndex = petIndex,
+	}
+
+	print(`[PetReplication] Spawned pet {petData.Id} for {player.Name} at index {petIndex}`)
+end
+
+function PetReplication.DespawnPet(player: Player, uuid: string)
+	if not ActivePets[player] then
+		return
 	end
-	
-	local availableModels = cartProductsFolder:GetChildren()
-	if #availableModels == 0 then
-		warn("[Grocery] Nessun model in ServerStorage.CartProducts!")
-		return false
+
+	local petData = ActivePets[player][uuid]
+	if not petData then
+		return
 	end
-	
-	-- Scegli un model casuale (o l'unico disponibile)
-	local randomModel = availableModels[math.random(1, #availableModels)]
-	local clone = randomModel:Clone()
-	
-	-- Trova o imposta la PrimaryPart prima di scalare
-	if not clone.PrimaryPart then
-		clone.PrimaryPart = clone:FindFirstChildWhichIsA("BasePart") or clone:FindFirstChildWhichIsA("UnionOperation")
+
+	if petData.Model and petData.Model.Parent then
+		petData.Model:Destroy()
 	end
-	
-	-- Disabilita collisioni e anchored per tutte le parti
-	for _, part in ipairs(clone:GetDescendants()) do
-		if part:IsA("BasePart") or part:IsA("UnionOperation") then
-			part.CanCollide = false
-			part.Anchored = false
+
+	ActivePets[player][uuid] = nil
+
+	print(`[PetReplication] Despawned pet {uuid} for {player.Name}`)
+end
+
+-- Re-shuffles the pets when one is removed so there are no gaps
+function PetReplication.RecalculatePositions(player: Player)
+	if not ActivePets[player] then
+		return
+	end
+
+	local character = player.Character
+	if not character or not character.PrimaryPart then
+		return
+	end
+
+	local totalPets = 0
+	for _ in ActivePets[player] do
+		totalPets += 1
+	end
+
+	local newIndex = 1
+	for uuid, petData in ActivePets[player] do
+		petData.PetIndex = newIndex
+
+		local targetPos = CalculatePetPosition(character, newIndex, totalPets)
+		if targetPos and petData.Model and petData.Model.PrimaryPart then
+			petData.Model.PrimaryPart.CFrame = CFrame.new(targetPos)
 		end
+
+		newIndex += 1
 	end
-	
-	-- Welda tutte le parti del model tra loro per evitare che si smolecolino
-	local primaryPart = clone.PrimaryPart
-	if primaryPart then
-		for _, part in ipairs(clone:GetDescendants()) do
-			if (part:IsA("BasePart") or part:IsA("UnionOperation")) and part ~= primaryPart then
-				local internalWeld = Instance.new("WeldConstraint")
-				internalWeld.Part0 = primaryPart
-				internalWeld.Part1 = part
-				internalWeld.Parent = part
+end
+
+local function UpdatePetPositions(deltaTime: number)
+	for player, petsTable in ActivePets do
+		local character = player.Character
+		if character and character.PrimaryPart then
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			local isMoving = humanoid and humanoid.WalkSpeed > 0 and (humanoid.MoveDirection.Magnitude > 0.1)
+
+			local totalPets = 0
+			for _ in petsTable do
+				totalPets += 1
+			end
+
+			for uuid, petData in petsTable do
+				if petData.Model and petData.Model.PrimaryPart then
+					if not petData.Velocity then
+						petData.Velocity = Vector3.new(0, 0, 0)
+					end
+
+					if not petData.FloatTime then
+						-- Randomize the float phase so they don't all bob in sync
+						petData.FloatTime = math.random() * math.pi * 2
+					end
+
+					local targetPos = CalculatePetPosition(character, petData.PetIndex, totalPets)
+
+					if targetPos then
+						-- Add floating animation to TARGET position (prevents physics fighting)
+						if not isMoving then
+							petData.FloatTime += deltaTime * Config.Constants.PetFloatSpeed
+							local floatOffset = math.sin(petData.FloatTime) * Config.Constants.PetFloatAmplitude
+							targetPos += Vector3.new(0, floatOffset, 0)
+						end
+
+						local currentPos = petData.Model.PrimaryPart.Position
+						local distance = (targetPos - currentPos).Magnitude
+
+						-- Speed scales with distance - pets catch up faster if they fall behind
+						local speed = Config.Constants.FollowSpeed
+						if distance > Config.Constants.PetDistanceThreshold then
+							local speedMultiplier = math.min(distance / Config.Constants.PetDistanceThreshold, 2)
+							speed = math.min(speed * speedMultiplier, Config.Constants.PetFollowMaxSpeed)
+						end
+
+						-- Velocity lerping
+						local direction = (targetPos - currentPos).Unit
+						local lerpAlpha = math.clamp(speed * deltaTime * 5, 0, 1)
+
+						if distance > 0.1 then
+							petData.Velocity = petData.Velocity:Lerp(direction * distance * speed * 10, lerpAlpha)
+						else
+							-- Slow down smoothly when arriving
+							petData.Velocity = petData.Velocity:Lerp(Vector3.new(0, 0, 0), lerpAlpha * 2)
+						end
+
+						local newPos = currentPos + petData.Velocity * deltaTime
+
+						-- Rotation logic
+						local currentCFrame = petData.Model.PrimaryPart.CFrame
+						local targetLook
+						local horizontalDist = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(
+							currentPos.X,
+							0,
+							currentPos.Z
+						)).Magnitude
+
+						if horizontalDist > 0.5 then
+							-- Moving: face the direction we're traveling
+							local lookDir = (targetPos - currentPos) * Vector3.new(1, 0, 1)
+							if lookDir.Magnitude > 0.01 then
+								targetLook = lookDir.Unit
+							else
+								targetLook = character.PrimaryPart.CFrame.LookVector
+							end
+						else
+							-- Idle: match the player's facing direction
+							targetLook = character.PrimaryPart.CFrame.LookVector
+						end
+
+						local targetCFrame = CFrame.new(newPos, newPos + targetLook)
+
+						petData.Model.PrimaryPart.CFrame =
+							currentCFrame:Lerp(targetCFrame, Config.Constants.PetRotationSpeed)
+					end
+				end
 			end
 		end
 	end
-	
-	-- Pulisci clone
-	local cloneHighlight = clone:FindFirstChildOfClass("Highlight")
-	if cloneHighlight then cloneHighlight:Destroy() end
-	local clonePrompt = clone:FindFirstChildOfClass("ProximityPrompt")
-	if clonePrompt then clonePrompt:Destroy() end
-	
-	-- Weld al carrello
-	local cartMain = cart:FindFirstChild("Main")
-	if cartMain then
-		-- Trova la parte principale del clone da weldare (BasePart o Union)
-		local clonePrimaryPart = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart") or clone:FindFirstChildWhichIsA("UnionOperation")
-		if not clonePrimaryPart then
-			warn("[Grocery] Clone senza BasePart/Union per weld")
-			return false
-		end
-		
-		-- Imposta come PrimaryPart se non è già impostata
-		if not clone.PrimaryPart then
-			clone.PrimaryPart = clonePrimaryPart
-		end
-		
-		local weldConstraint = Instance.new("WeldConstraint")
-		weldConstraint.Part0 = cartMain
-		weldConstraint.Part1 = clonePrimaryPart
-		weldConstraint.Parent = clonePrimaryPart
-		
-		-- Posiziona nel carrello
-		-- Usa la ProductZone se esiste, altrimenti fallback a Main
-		local productZone = cart:FindFirstChild("ProductZone", true) or cartMain
-		
-		-- Posiziona i prodotti dentro il carrello in modo organizzato
-		local column = (#inventory - 1) % 3 -- Colonna (0, 1, 2)
-		local row = math.floor((#inventory - 1) / 3) -- Riga
-		
-		local offsetX = (column - 1) * 0.4 -- Spaziatura orizzontale
-		local offsetY = 0.5 + (row * 0.4) -- Impila verticalmente
-		local offsetZ = 0 -- Centrato in profondità
-		
-		clone:SetPrimaryPartCFrame(productZone.CFrame * CFrame.new(offsetX, offsetY, offsetZ))
-		
-		clone.Parent = cart
-	end
-	
-	print("[Grocery]", player.Name, "picked up product")
-	return true
 end
 
--- Setup shelfs
-local function setupShelfs()
-	local storeFolder = workspace:FindFirstChild("Store")
-	if not storeFolder then
-		warn("[Grocery] Folder 'Store' non trovata!")
+-- Clean up everything when a player leaves to prevent memory leaks
+local function OnPlayerRemoving(player: Player)
+	if not ActivePets[player] then
 		return
 	end
-	local shelfsFolder = storeFolder:FindFirstChild("Shelfs")
-	if not shelfsFolder then
-		warn("[Grocery] Folder 'Shelfs' non trovata dentro 'store'!")
-		return
-	end
-	
-	-- Conta quante shelf ci sono
-	local allShelfs = {}
-	for _, shelf in ipairs(shelfsFolder:GetChildren()) do
-		if shelf:IsA("Model") and shelf.Name == "ShefWithProducts" then
-			table.insert(allShelfs, shelf)
+
+	for uuid, petData in ActivePets[player] do
+		if petData.Model and petData.Model.Parent then
+			petData.Model:Destroy()
 		end
 	end
-	
-	if #allShelfs == 0 then
-		warn("[Grocery] Nessuna shelf trovata!")
-		return
-	end
-	
-	-- Distribuisci i prodotti equamente tra tutte le shelf
-	local productsPerShelf = math.ceil(PRODUCTS_TO_HIGHLIGHT / #allShelfs)
-	
-	for _, shelf in ipairs(allShelfs) do
-		highlightRandomProducts(shelf, productsPerShelf)
-	end
-	
-	print("[Grocery] Setup completato su", #allShelfs, "shelf")
+
+	ActivePets[player] = nil
+	print(`[PetReplication] Cleaned up all pets for {player.Name}`)
 end
 
--- Cleanup
-Players.PlayerRemoving:Connect(function(player)
-	playerInventories[player.UserId] = nil
-	hideHighlightsForPlayer(player)
-end)
+function PetReplication.Init()
+	InitServerPetsFolder()
 
--- Monitora i player esistenti e nuovi
-for _, player in ipairs(Players:GetPlayers()) do
-	task.spawn(function()
-		monitorPlayerAttachment(player)
+	-- Hook into Heartbeat for smooth updates
+	RunService.Heartbeat:Connect(function(deltaTime)
+		frameCount += 1
+		if frameCount % Config.Constants.ServerPetUpdateRate == 0 then
+			UpdatePetPositions(deltaTime)
+		end
 	end)
+
+	Players.PlayerRemoving:Connect(OnPlayerRemoving)
+
+	print("[PetReplication] Initialized")
 end
 
-Players.PlayerAdded:Connect(function(player)
-	task.spawn(function()
-		monitorPlayerAttachment(player)
-	end)
-end)
-
--- Avvia dopo 2 secondi
-task.wait(2)
-setupShelfs()
-
-print("[Grocery] Sistema pronto")
+return PetReplication
