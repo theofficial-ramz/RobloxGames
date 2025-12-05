@@ -240,91 +240,85 @@ function PetReplication.RecalculatePositions(player: Player)
 	end
 end
 
+-- Updates a single pet's position and rotation
+local function UpdateSinglePet(petData: any, character: Model, totalPets: number, isMoving: boolean, deltaTime: number)
+	local model = petData.Model
+	if not model or not model.PrimaryPart then
+		return
+	end
+
+	-- Initialize state if needed
+	petData.Velocity = petData.Velocity or Vector3.new(0, 0, 0)
+	petData.FloatTime = petData.FloatTime or (math.random() * math.pi * 2)
+
+	local targetPos = CalculatePetPosition(character, petData.PetIndex, totalPets)
+	if not targetPos then
+		return
+	end
+
+	-- Add floating animation when idle
+	if not isMoving then
+		petData.FloatTime += deltaTime * Config.Constants.PetFloatSpeed
+		local floatOffset = math.sin(petData.FloatTime) * Config.Constants.PetFloatAmplitude
+		targetPos += Vector3.new(0, floatOffset, 0)
+	end
+
+	local currentPos = model.PrimaryPart.Position
+	local distance = (targetPos - currentPos).Magnitude
+
+	-- Speed scales with distance - pets catch up faster if they fall behind
+	local speed = Config.Constants.FollowSpeed
+	if distance > Config.Constants.PetDistanceThreshold then
+		local speedMultiplier = math.min(distance / Config.Constants.PetDistanceThreshold, 2)
+		speed = math.min(speed * speedMultiplier, Config.Constants.PetFollowMaxSpeed)
+	end
+
+	-- Velocity lerping
+	local lerpAlpha = math.clamp(speed * deltaTime * 5, 0, 1)
+
+	if distance > 0.1 then
+		local direction = (targetPos - currentPos).Unit
+		petData.Velocity = petData.Velocity:Lerp(direction * distance * speed * 10, lerpAlpha)
+	else
+		petData.Velocity = petData.Velocity:Lerp(Vector3.new(0, 0, 0), lerpAlpha * 2)
+	end
+
+	local newPos = currentPos + petData.Velocity * deltaTime
+
+	-- Figure out which direction the pet should face
+	local horizontalDist = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(currentPos.X, 0, currentPos.Z)).Magnitude
+	local targetLook = character.PrimaryPart.CFrame.LookVector -- Default: match player
+
+	if horizontalDist > 0.5 then
+		local lookDir = (targetPos - currentPos) * Vector3.new(1, 0, 1)
+		if lookDir.Magnitude > 0.01 then
+			targetLook = lookDir.Unit
+		end
+	end
+
+	-- Apply new position and rotation
+	local currentCFrame = model.PrimaryPart.CFrame
+	local targetCFrame = CFrame.new(newPos, newPos + targetLook)
+	model.PrimaryPart.CFrame = currentCFrame:Lerp(targetCFrame, Config.Constants.PetRotationSpeed)
+end
+
 local function UpdatePetPositions(deltaTime: number)
 	for player, petsTable in ActivePets do
 		local character = player.Character
-		if character and character.PrimaryPart then
-			local humanoid = character:FindFirstChildOfClass("Humanoid")
-			local isMoving = humanoid and humanoid.WalkSpeed > 0 and (humanoid.MoveDirection.Magnitude > 0.1)
+		if not character or not character.PrimaryPart then
+			continue
+		end
 
-			local totalPets = 0
-			for _ in petsTable do
-				totalPets += 1
-			end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local isMoving = humanoid and humanoid.WalkSpeed > 0 and (humanoid.MoveDirection.Magnitude > 0.1)
 
-			for uuid, petData in petsTable do
-				if petData.Model and petData.Model.PrimaryPart then
-					if not petData.Velocity then
-						petData.Velocity = Vector3.new(0, 0, 0)
-					end
+		local totalPets = 0
+		for _ in petsTable do
+			totalPets += 1
+		end
 
-					if not petData.FloatTime then
-						-- Randomize the float phase so they don't all bob in sync
-						petData.FloatTime = math.random() * math.pi * 2
-					end
-
-					local targetPos = CalculatePetPosition(character, petData.PetIndex, totalPets)
-
-					if targetPos then
-						-- Add floating animation to TARGET position (prevents physics fighting)
-						if not isMoving then
-							petData.FloatTime += deltaTime * Config.Constants.PetFloatSpeed
-							local floatOffset = math.sin(petData.FloatTime) * Config.Constants.PetFloatAmplitude
-							targetPos += Vector3.new(0, floatOffset, 0)
-						end
-
-						local currentPos = petData.Model.PrimaryPart.Position
-						local distance = (targetPos - currentPos).Magnitude
-
-						-- Speed scales with distance - pets catch up faster if they fall behind
-						local speed = Config.Constants.FollowSpeed
-						if distance > Config.Constants.PetDistanceThreshold then
-							local speedMultiplier = math.min(distance / Config.Constants.PetDistanceThreshold, 2)
-							speed = math.min(speed * speedMultiplier, Config.Constants.PetFollowMaxSpeed)
-						end
-
-						-- Velocity lerping
-						local direction = (targetPos - currentPos).Unit
-						local lerpAlpha = math.clamp(speed * deltaTime * 5, 0, 1)
-
-						if distance > 0.1 then
-							petData.Velocity = petData.Velocity:Lerp(direction * distance * speed * 10, lerpAlpha)
-						else
-							-- Slow down smoothly when arriving
-							petData.Velocity = petData.Velocity:Lerp(Vector3.new(0, 0, 0), lerpAlpha * 2)
-						end
-
-						local newPos = currentPos + petData.Velocity * deltaTime
-
-						-- Rotation logic
-						local currentCFrame = petData.Model.PrimaryPart.CFrame
-						local targetLook
-						local horizontalDist = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(
-							currentPos.X,
-							0,
-							currentPos.Z
-						)).Magnitude
-
-						if horizontalDist > 0.5 then
-							-- Moving: face the direction we're traveling
-							local lookDir = (targetPos - currentPos) * Vector3.new(1, 0, 1)
-							if lookDir.Magnitude > 0.01 then
-								targetLook = lookDir.Unit
-							else
-								targetLook = character.PrimaryPart.CFrame.LookVector
-							end
-						else
-							-- Idle: match the player's facing direction
-							targetLook = character.PrimaryPart.CFrame.LookVector
-						end
-
-						local targetCFrame = CFrame.new(newPos, newPos + targetLook)
-
-						petData.Model.PrimaryPart.CFrame =
-							currentCFrame:Lerp(targetCFrame, Config.Constants.PetRotationSpeed)
-					end
-				end
-			end
+		for _, petData in petsTable do
+			UpdateSinglePet(petData, character, totalPets, isMoving, deltaTime)
 		end
 	end
 end
